@@ -26,6 +26,16 @@ DEFAULT_HEAD_LINES = 10
 DEFAULT_TAIL_LINES = 10
 MAX_GREP_MATCHES = 50
 
+# ReDoS guards for model-supplied grep patterns (see build_matcher).
+# Regex matching is only attempted against the first MAX_REGEX_LINE_CHARS of any
+# line — catastrophic backtracking grows super-linearly with input length, so
+# bounding the scanned length bounds the worst-case work per line. The wall-clock
+# budget is a cumulative backstop across a single grep scan: once the regex engine
+# has spent more than REGEX_TIME_BUDGET_SECONDS in aggregate, subsequent lines are
+# skipped instead of being matched, so a pathological pattern cannot run unbounded.
+MAX_REGEX_LINE_CHARS = 10_000
+REGEX_TIME_BUDGET_SECONDS = 2.0
+
 
 # =============================================================================
 # SHARED REGEX UTILITIES — also used by builtin.py grep_knowledge_files
@@ -51,6 +61,57 @@ def normalize_regex(pattern: str) -> str:
     return pattern.replace('\\|', '|').replace('\|', '|')
 
 
+# A parenthesized group quantified by an unbounded quantifier (+, *, {n,}) whose
+# body itself contains an unbounded quantifier — the classic catastrophic
+# backtracking signature, e.g. (a+)+, ([a-z]+)*, (.*a)*, (\d+){2,}. Bounded
+# quantifiers ({m,n}) and non-nested patterns (\d+, [a-z]+, (foo|bar)+) are not
+# matched, so legitimate searches keep working.
+_GROUP_WITH_QUANT = re.compile(r'\((?P<body>(?:[^()\\]|\\.)*)\)\s*(?P<quant>[*+]|\{\d*,\}?\d*\})')
+_INNER_UNBOUNDED_QUANT = re.compile(r'(?:[*+]|\{\d+,\})')
+
+
+def _is_unbounded_quantifier(quant: str) -> bool:
+    """True for *, +, or {n,} (no upper bound); False for bounded forms like {m,n}."""
+    if quant in ('*', '+'):
+        return True
+    return quant.endswith(',}')
+
+
+def has_catastrophic_regex(pattern: str) -> bool:
+    """Heuristically detect nested unbounded quantifiers prone to ReDoS backtracking."""
+    for match in _GROUP_WITH_QUANT.finditer(pattern):
+        if not _is_unbounded_quantifier(match.group('quant')):
+            continue
+        # Drop escaped characters so \+ / \* are not treated as quantifiers.
+        body = re.sub(r'\\.', '', match.group('body'))
+        if _INNER_UNBOUNDED_QUANT.search(body):
+            return True
+    return False
+
+
+def _make_regex_matcher(compiled: 're.Pattern') -> 'callable':
+    """Wrap a compiled regex with per-line length cap + cumulative wall-clock budget.
+
+    The line is truncated to MAX_REGEX_LINE_CHARS before searching, and once the
+    aggregate time spent matching exceeds REGEX_TIME_BUDGET_SECONDS the matcher
+    stops evaluating further lines (returns False) so a single grep scan can never
+    run unbounded, even if a pathological pattern slips past has_catastrophic_regex.
+    """
+    state = {'deadline': None}
+
+    def _match(line: str) -> bool:
+        now = time.monotonic()
+        if state['deadline'] is None:
+            state['deadline'] = now + REGEX_TIME_BUDGET_SECONDS
+        elif now > state['deadline']:
+            return False
+        if len(line) > MAX_REGEX_LINE_CHARS:
+            line = line[:MAX_REGEX_LINE_CHARS]
+        return bool(compiled.search(line))
+
+    return _match
+
+
 def build_matcher(pattern: str, case_insensitive: bool = False, use_regex: bool = False) -> tuple:
     """Build a matcher function. Returns (match_fn, error_str_or_None)."""
     if not use_regex and is_regex_pattern(pattern):
@@ -58,12 +119,18 @@ def build_matcher(pattern: str, case_insensitive: bool = False, use_regex: bool 
 
     if use_regex:
         normalized = normalize_regex(pattern)
+        if has_catastrophic_regex(normalized):
+            return None, (
+                'Invalid regex: nested unbounded quantifiers (e.g. (x+)+, (x*)*) are not '
+                'allowed because they can cause catastrophic backtracking. Rewrite the '
+                'pattern without the nested repetition.'
+            )
         try:
             re_flags = re.IGNORECASE if case_insensitive else 0
             compiled = re.compile(normalized, re_flags)
         except re.error as e:
             return None, f'Invalid regex: {e}'
-        return (lambda line: bool(compiled.search(line))), None
+        return _make_regex_matcher(compiled), None
     else:
         sp = pattern.lower() if case_insensitive else pattern
         return (lambda line: sp in (line.lower() if case_insensitive else line)), None
